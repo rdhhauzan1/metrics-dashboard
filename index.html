@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prometheus Metrics Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <h1>Prometheus Metrics Viewer</h1>
+        <p>Hit a Prometheus-formatted metrics endpoint and graph all reported series.</p>
+      </div>
+      <div class="controls">
+        <label>
+          Metrics URL
+          <input id="metrics-url" type="url" value="http://localhost:9100/metrics" />
+        </label>
+        <label>
+          Refresh every
+          <select id="refresh-interval">
+            <option value="3000">3s</option>
+            <option value="5000" selected>5s</option>
+            <option value="15000">15s</option>
+          </select>
+        </label>
+        <button id="refresh-now" type="button">Refresh now</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="status-row">
+        <p id="status">Starting...</p>
+      </section>
+      <section class="metrics-section">
+        <h2>Proxy status</h2>
+        <div id="proxy-status" class="proxy-grid"></div>
+      </section>
+    </main>
+
+    <script>
+      const statusEl = document.getElementById('status');
+      const proxyStatusContainer = document.getElementById('proxy-status');
+      const urlInput = document.getElementById('metrics-url');
+      const refreshSelect = document.getElementById('refresh-interval');
+      const refreshNowButton = document.getElementById('refresh-now');
+
+      let pollingTimer;
+
+      const proxyValueMetricNames = new Set([
+        'proxy_active_connections',
+        'proxy_affinity_cache_size',
+      ]);
+      const upstreamMetricName = 'proxy_upstream_health';
+      const priorityMetrics = [
+        'proxy_active_connections',
+        'proxy_affinity_cache_size',
+      ];
+      const allowedMetricNames = new Set([
+        ...proxyValueMetricNames,
+        upstreamMetricName,
+      ]);
+
+      const proxyStatusRegistry = new Map();
+
+      const getSeriesTitle = (name, labels) => {
+        const labelText = labels
+          ? Object.entries(labels)
+              .map(([k, v]) => `${k}=${v}`)
+              .join(', ')
+          : '';
+        return labelText ? `${name} (${labelText})` : name;
+      };
+
+      const createSeriesKey = (name, labels) => {
+        if (!labels) return name;
+        const labelParts = Object.entries(labels)
+          .map(([key, value]) => `${key}=${value}`)
+          .sort()
+          .join(',');
+        return `${name}|${labelParts}`;
+      };
+
+      const parsePrometheus = (text) => {
+        return text
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith('#'))
+          .map((line) => {
+            const match = line.match(/^([^{\s]+)(\{([^}]*)\})?\s+(.+)$/);
+            if (!match) return null;
+            const name = match[1];
+            if (!allowedMetricNames.has(name)) {
+              return null;
+            }
+            const labels = match[3]
+              ? Object.fromEntries(
+                  match[3]
+                    .split(',')
+                    .map((pair) => pair.trim())
+                    .map((pair) => {
+                      const [key, value] = pair.split('=');
+                      return [key, value?.replace(/^"(.*)"$/, '$1')];
+                    })
+                )
+              : null;
+            const value = Number(match[4]);
+            if (Number.isNaN(value)) return null;
+            const key = createSeriesKey(name, labels);
+            return {
+              name,
+              labels,
+              value,
+              key,
+              title: getSeriesTitle(name, labels),
+            };
+          })
+          .filter(Boolean);
+      };
+
+      const ensureStatusCard = (seriesKey, title, name) => {
+        if (proxyStatusRegistry.has(seriesKey)) return proxyStatusRegistry.get(seriesKey);
+
+        const card = document.createElement('article');
+        card.className = 'status-card';
+        const heading = document.createElement('h3');
+        heading.textContent = title;
+        const valueEl = document.createElement('p');
+        valueEl.className = 'status-value';
+        const timestampEl = document.createElement('p');
+        timestampEl.className = 'status-updated';
+
+        card.append(heading, valueEl, timestampEl);
+        proxyStatusContainer.appendChild(card);
+
+        card.dataset.metric = name || '';
+        const info = { card, heading, valueEl, timestampEl, name, value: 0 };
+        proxyStatusRegistry.set(seriesKey, info);
+        return info;
+      };
+
+      const updateProxyStatus = (samples) => {
+        const timestamp = new Date().toLocaleTimeString([], { hour12: false });
+        samples.forEach((sample) => {
+          const card = ensureStatusCard(sample.key, sample.title, sample.name);
+          card.heading.textContent = sample.title;
+          card.valueEl.textContent = sample.value;
+          card.timestampEl.textContent = `Updated at ${timestamp}`;
+          card.name = sample.name;
+          card.value = sample.value;
+          card.card.dataset.metric = sample.name;
+          if (sample.name === upstreamMetricName) {
+            card.card.dataset.state = sample.value === 1 ? 'healthy' : 'unhealthy';
+          } else {
+            card.card.dataset.state = 'info';
+          }
+        });
+        reorderProxyCards();
+      };
+
+      const getOrderedSeriesKeys = () => {
+        const entries = Array.from(proxyStatusRegistry.entries());
+        const orderedPrimary = priorityMetrics.map(() => null);
+        const others = [];
+
+        entries.forEach(([key, info]) => {
+          const primaryIndex = priorityMetrics.indexOf(info.name);
+          if (primaryIndex !== -1) {
+            orderedPrimary[primaryIndex] = key;
+            return;
+          }
+          others.push({ key, value: info.value ?? 0 });
+        });
+
+        others.sort((a, b) => a.value - b.value);
+
+        return [
+          ...orderedPrimary.filter(Boolean),
+          ...others.map((entry) => entry.key),
+        ];
+      };
+
+      const reorderProxyCards = () => {
+        getOrderedSeriesKeys().forEach((key) => {
+          const info = proxyStatusRegistry.get(key);
+          if (info) {
+            proxyStatusContainer.appendChild(info.card);
+          }
+        });
+      };
+
+      const updateStatus = (message, isError = false) => {
+        statusEl.textContent = message;
+        statusEl.dataset.error = isError ? 'true' : 'false';
+      };
+
+      const fetchMetrics = async () => {
+        const url = urlInput.value.trim();
+        if (!url) {
+          updateStatus('Enter a valid metrics URL.', true);
+          return;
+        }
+        try {
+          const response = await fetch(url, { cache: 'no-store' });
+          if (!response.ok) {
+            throw new Error(`server returned ${response.status}`);
+          }
+          const text = await response.text();
+          const samples = parsePrometheus(text);
+          updateProxyStatus(samples);
+          updateStatus(`Last refreshed at ${new Date().toLocaleTimeString([], { hour12: false })}`);
+        } catch (error) {
+          updateStatus(`Failed to load metrics: ${error.message}`, true);
+        }
+      };
+
+      const setPollingInterval = () => {
+        if (pollingTimer) {
+          clearInterval(pollingTimer);
+        }
+        fetchMetrics();
+        const interval = Number(refreshSelect.value);
+        pollingTimer = setInterval(fetchMetrics, interval);
+      };
+
+      refreshSelect.addEventListener('change', setPollingInterval);
+      refreshNowButton.addEventListener('click', fetchMetrics);
+
+      document.addEventListener('DOMContentLoaded', setPollingInterval);
+    </script>
+  </body>
+</html>
