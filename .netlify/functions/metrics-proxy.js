@@ -1,5 +1,7 @@
-export const handler = async () => {
+export const handler = async (event) => {
   const targetUrl = 'http://167.71.223.183:9090/metrics';
+  const originHeader = event?.headers?.origin;
+  const allowOrigin = originHeader || '*';
 
   try {
     const response = await fetch(targetUrl, { cf: { cacheTtl: 0 } });
@@ -9,7 +11,7 @@ export const handler = async () => {
       statusCode: 200,
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': allowOrigin,
         'Access-Control-Allow-Methods': 'GET',
       },
       body,
